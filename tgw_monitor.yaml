@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: |
+  Deploys Lambda Function
+
+
+Parameters:
+  AssumeRole:
+    Description: Network Account Assume Role
+    Type: String
+    
+Resources:
+
+  TGWStatusQueryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub tgw-status-query-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub tgw-status-query-lambda-role-inline-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub arn:aws:iam::${NetworkAccountID}:role/${AssumeRole}
+
+  TGWStatusQueryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Queries the Network Account Transit Gateway Attachments Status
+      FunctionName: tgw-status-query-lambda
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt 'TGWStatusQueryLambdaRole.Arn'
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ASSUME_ROLE_ARN: !Sub arn:aws:iam::${NetworkAccountID}:role/${AssumeRole}
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import boto3
+          import logging 
+          import os 
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          sts_client = boto3.client('sts')
+
+          assume_role_arn = os.environ.get("ASSUME_ROLE_ARN")
+
+          def lambda_handler(event, context):
+              LOGGER.info(f"Started assuming role: {assume_role_arn}")
+              try:
+                  assumedRole = sts_client.assume_role(
+                  RoleArn=assume_role_arn,
+                  RoleSessionName='network_account_assume_role'
+                  )
+                  boto3_session_object = boto3.Session(
+                                              aws_access_key_id=assumedRole['Credentials']['AccessKeyId'],
+                                              aws_secret_access_key=assumedRole['Credentials']['SecretAccessKey'],
+                                              aws_session_token=assumedRole['Credentials']['SessionToken']
+                                              )
+                  ec2_client= boto3_session_object.client("ec2")
+                  try:
+                      response = ec2Client.describe_transit_gateway_attachments(
+                          Filters=[
+                              {
+                                  'Name': 'resource-type',
+                                  'Values': [
+                                      'vpc',
+                                  ]
+                              }
+                      )
+                      for tgw_attachment in response.get("TransitGatewayAttachments"):
+                          tgw_attachment_list.append(
+                                  {
+                                  "account_id": tgw_attachment.get("ResourceOwnerId"), 
+                                  "vpc_id": tgw_attachment.get("ResourceId"),
+                                  "region": region
+                                  }
+                              )
+                  except Exception as error:
+                      LOGGER.error(error)    
+              except Exception as error:
+              
+  CloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: tgw-status-query-lambda-cloudwatch-event-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: tgw-status-query-lambda-cloudwatch-event-role-inline-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt 'TGWStatusQueryLambda.Arn'
+
+  CloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: tgw-status-query-lambda-cw-event-rule
+      Description: Rule to schedule 
+      RoleArn: !GetAtt 'CloudWatchEventRole.Arn'
+      ScheduleExpression: "cron(0 6 ? * SUN *)"
+      Targets:
+        - Arn: !GetAtt 'TGWStatusQueryLambda.Arn'
+          RoleArn: !GetAtt CloudWatchEventRole.Arn
+          Id: tgw-status-query-lambda-cw-event              
